@@ -59,8 +59,10 @@ print(f"sum log p = {total.item():.3f}   mean log p = {mean.item():.3f}")
 # %%
 def my_dpo_loss(pc, pr, rc, rr, beta=0.1):
     """pc/pr: policy log-prob chosen/rejected; rc/rr: reference. Trả về loss trung bình."""
-    # TODO: viết bằng torch.nn.functional.logsigmoid
-    return None
+    # reward ngầm = beta * log(policy / reference); loss = -log sigmoid(reward_chosen - reward_rejected)
+    chosen_reward = beta * (pc - rc)
+    rejected_reward = beta * (pr - rr)
+    return -torch.nn.functional.logsigmoid(chosen_reward - rejected_reward).mean()
 
 
 # %%
@@ -75,6 +77,16 @@ else:
     print(f"✓ Khớp tham chiếu: {ref_loss.item():.4f}")
 
 # %% [markdown]
+# Kiểm tra thêm bằng công thức đóng: với cặp đầu tiên margin = β·[(−12+13) − (−15+14)] = 0.1·2 = 0.2 và
+# với cặp thứ hai margin = β·[(−30+29) − (−28+29)] = 0.1·(−2) = −0.2, nên
+# loss = ½·[−log σ(0.2) − log σ(−0.2)].
+
+# %%
+closed_form = 0.5 * (-math.log(1 / (1 + math.exp(-0.2))) - math.log(1 / (1 + math.exp(0.2))))
+assert abs(float(my_dpo_loss(pc, pr, rc, rr, beta=0.1)) - closed_form) < 1e-6, closed_form
+print(f"✓ Khớp công thức đóng: {closed_form:.4f}")
+
+# %% [markdown]
 # ## 3. Bước 0: mô hình đang học (policy) = reference ⇒ loss = log 2
 #
 # NB3 khởi tạo mô hình đang học (policy) bằng chính mô hình SFT (LoRA mới có trọng số B = 0), nên
@@ -85,6 +97,9 @@ else:
 same = torch.tensor([-20.0, -35.0])
 loss0, cr0, rr0 = M.dpo_loss(same, same - 3, same, same - 3)
 print(f"loss at init = {loss0.item():.4f}   log 2 = {math.log(2):.4f}   rewards = {cr0.tolist()}, {rr0.tolist()}")
+if mine is not None:
+    assert abs(float(my_dpo_loss(same, same - 3, same, same - 3)) - math.log(2)) < 1e-6
+    print("✓ my_dpo_loss = log 2 khi policy = reference")
 
 # %% [markdown]
 # ## 4. Trọng số gradient = sigmoid(−margin)
@@ -148,3 +163,31 @@ print(f"ORPO  {M.orpo_loss(avg_c, avg_r, -avg_c).item():.4f}")
 # **Câu hỏi cho REFLECTION §3:** tổng log-prob của câu dài luôn âm hơn câu ngắn.
 # Vì sao điều đó khiến DPO gốc dễ thiên vị độ dài, và SimPO/ORPO xử lý bằng cách nào?
 # Gợi ý: NB2 in ra tỉ lệ cặp có chosen dài hơn rejected trong dữ liệu tiếng Việt.
+
+# %% [markdown]
+# ## 7. Trả lời câu hỏi NB0: vì sao margin tăng được trong khi log-xác suất của `chosen` giảm?
+#
+# Loss DPO **chỉ phụ thuộc vào hiệu số** (margin) giữa hai reward ngầm:
+#
+# $$\text{margin} = \beta\big[(\log\pi_\theta(y_w)-\log\pi_{ref}(y_w)) - (\log\pi_\theta(y_l)-\log\pi_{ref}(y_l))\big]$$
+#
+# Không có số hạng nào ép riêng log π(chosen) phải tăng. Ở mục 5, kịch bản A (chosen +1, rejected −1) và kịch
+# bản B (chosen −3, rejected −5) đều cho margin = 2 nên loss **giống hệt nhau**, nhưng ở B log-xác suất của
+# `chosen` giảm 3 nat. Chỉ cần `rejected` giảm **nhanh hơn** `chosen` (5 > 3) thì margin vẫn dương và tăng, loss vẫn
+# giảm. Gradient của DPO đồng thời đẩy `chosen` lên và `rejected` xuống với cùng độ lớn σ(−margin); vì các câu trả
+# lời tiếng Việt `chosen` và `rejected` thường rất giống nhau về từ vựng và cấu trúc, việc hạ xác suất của câu
+# `rejected` cũng kéo theo xác suất của các token dùng chung trong `chosen` đi xuống. Khối xác suất bị lấy đi
+# không nhất thiết chảy sang câu `chosen`, mà có thể chảy sang những chuỗi khác mà không dữ liệu nào đo. Đó là
+# **dịch chuyển xác suất** (likelihood displacement). Cách xử lý: RPO thêm NLL của `chosen` vào loss để phạt kịch
+# bản B (mục 5), hoặc LD-DPO (NB3b). Vì vậy khi đọc NB3 phải vẽ riêng `rewards/chosen` và `rewards/rejected`, không
+# được chỉ nhìn margin.
+#
+# ## 8. Trả lời câu hỏi về độ dài
+#
+# Reward ngầm của DPO là tổng trên mọi token của câu trả lời: β·Σ_t log(π_θ/π_ref). Câu càng dài thì có càng nhiều
+# số hạng, nên chỉ một mức tăng nhỏ trên từng token cũng cộng thành margin lớn. Nếu trong dữ liệu `chosen` thường dài
+# hơn `rejected` (NB2 đo tỉ lệ này), cách dễ nhất để tăng margin là nâng xác suất của nhiều token hơn trong câu dài,
+# tức là học "viết dài thì được điểm", chứ không nhất thiết là viết hay hơn. SimPO và ORPO dùng log-xác suất **trung
+# bình theo token** (`avg_logps`) thay cho tổng, nên reward không còn tỉ lệ thuận với độ dài. Hai phương pháp này
+# cũng không cần mô hình tham chiếu: SimPO thêm margin mục tiêu γ, còn ORPO cộng NLL của `chosen` và phạt log-odds-ratio.
+# IPO và DPO-norm (`sigmoid_norm` trong TRL) chuẩn hoá theo độ dài theo cách riêng của chúng.
